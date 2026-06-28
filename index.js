@@ -1,7 +1,6 @@
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
-const clients = new Set();
 
 let cachedToken = null;
 let tokenExpiry = 0;
@@ -35,10 +34,41 @@ async function getToken() {
   });
 }
 
+async function handleMCP(msg) {
+  if (msg.method === 'initialize') {
+    return { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'sfmc', version: '1.0.0' } };
+  }
+  if (msg.method === 'tools/list') {
+    return { tools: [
+      { name: 'get_dataextensions', description: 'Liste les Data Extensions SFMC', inputSchema: { type: 'object', properties: {} } },
+      { name: 'get_journeys', description: 'Liste les journeys SFMC', inputSchema: { type: 'object', properties: {} } }
+    ]};
+  }
+  if (msg.method === 'tools/call') {
+    const token = await getToken();
+    const path = msg.params.name === 'get_journeys'
+      ? '/interaction/v1/interactions?$pageSize=20'
+      : '/data/v1/customobjectdata/types/dataextension/collection?$pageSize=20';
+    const data = await new Promise((resolve, reject) => {
+      const r = https.request(`https://${process.env.SFMC_SUBDOMAIN}.rest.marketingcloudapis.com${path}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      }, res => {
+        let d = '';
+        res.on('data', c => d += c);
+        res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { reject(new Error(d)); } });
+      });
+      r.on('error', reject);
+      r.end();
+    });
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  }
+  return {};
+}
+
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization, Mcp-Session-Id');
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -49,84 +79,28 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (url.pathname === '/oauth/token' && req.method === 'POST') {
-    try {
-      const token = await getToken();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ access_token: token, token_type: 'Bearer', expires_in: 1080 }));
-    } catch(e) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  if (url.pathname === '/sse') {
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive'
-    });
-    const host = req.headers.host;
-    const endpoint = `https://${host}/messages`;
-    res.write(`event: endpoint\ndata: ${endpoint}\n\n`);
-    clients.add(res);
-    req.on('close', () => clients.delete(res));
-    return;
-  }
-
-  if (url.pathname === '/messages' && req.method === 'POST') {
+  if (url.pathname === '/mcp' && req.method === 'POST') {
     let body = '';
     req.on('data', d => body += d);
     req.on('end', async () => {
-      let msg;
-      try { msg = JSON.parse(body); } catch(e) {
-        res.writeHead(400); res.end(); return;
+      try {
+        const msg = JSON.parse(body);
+        const result = await handleMCP(msg);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }));
+      } catch(e) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32000, message: e.message } }));
       }
-      let response;
-      if (msg.method === 'initialize') {
-        response = { jsonrpc: '2.0', id: msg.id, result: {
-          protocolVersion: '2024-11-05',
-          capabilities: { tools: {} },
-          serverInfo: { name: 'sfmc', version: '1.0.0' }
-        }};
-      } else if (msg.method === 'tools/list') {
-        response = { jsonrpc: '2.0', id: msg.id, result: { tools: [
-          { name: 'get_journeys', description: 'Liste les journeys SFMC', inputSchema: { type: 'object', properties: {} } },
-          { name: 'get_dataextensions', description: 'Liste les Data Extensions SFMC', inputSchema: { type: 'object', properties: {} } }
-        ]}};
-      } else if (msg.method === 'tools/call') {
-        try {
-          const token = await getToken();
-          const path = msg.params.name === 'get_journeys'
-            ? '/interaction/v1/interactions?$pageSize=20'
-            : '/data/v1/customobjectdata/types/dataextension/collection?$pageSize=20';
-          const data = await new Promise((resolve, reject) => {
-            const r = https.request(`https://${process.env.SFMC_SUBDOMAIN}.rest.marketingcloudapis.com${path}`, {
-              headers: { Authorization: `Bearer ${token}` }
-            }, res => {
-              let d = '';
-              res.on('data', c => d += c);
-              res.on('end', () => {
-                try { resolve(JSON.parse(d)); } catch(e) { reject(new Error('API parse error: ' + d)); }
-              });
-            });
-            r.on('error', reject);
-            r.end();
-          });
-          response = { jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: JSON.stringify(data) }] }};
-        } catch(e) {
-          response = { jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: e.message }};
-        }
-      } else {
-        response = { jsonrpc: '2.0', id: msg.id, result: {} };
-      }
-      for (const client of clients) {
-        client.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
-      }
-      res.writeHead(200);
-      res.end();
     });
+    return;
+  }
+
+  // Garde l'ancien SSE pour compatibilité
+  if (url.pathname === '/sse') {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+    res.write(`event: endpoint\ndata: https://${req.headers.host}/mcp\n\n`);
+    req.on('close', () => {});
     return;
   }
 
