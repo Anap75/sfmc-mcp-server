@@ -79,6 +79,38 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // OAuth authorize — redirige vers claude.ai avec le code
+  if (url.pathname === '/authorize') {
+    const redirectUri = url.searchParams.get('redirect_uri');
+    const state = url.searchParams.get('state');
+    const codeChallenge = url.searchParams.get('code_challenge');
+    if (redirectUri) {
+      const callbackUrl = new URL(redirectUri);
+      callbackUrl.searchParams.set('code', 'sfmc_token_' + Date.now());
+      if (state) callbackUrl.searchParams.set('state', state);
+      res.writeHead(302, { Location: callbackUrl.toString() });
+      res.end();
+    } else {
+      res.writeHead(400);
+      res.end('Missing redirect_uri');
+    }
+    return;
+  }
+
+  // OAuth token exchange
+  if (url.pathname === '/token' && req.method === 'POST') {
+    try {
+      const token = await getToken();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ access_token: token, token_type: 'Bearer', expires_in: 1080 }));
+    } catch(e) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // MCP Streamable HTTP
   if (url.pathname === '/mcp' && req.method === 'POST') {
     let body = '';
     req.on('data', d => body += d);
@@ -96,7 +128,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Garde l'ancien SSE pour compatibilité
+  // SSE legacy
   if (url.pathname === '/sse') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
     res.write(`event: endpoint\ndata: https://${req.headers.host}/mcp\n\n`);
