@@ -1,78 +1,95 @@
-const express = require('express');
-const fetch = require('node-fetch');
-const app = express();
-app.use(express.json());
+const http = require('http');
+const { URL } = require('url');
+
+const clients = new Set();
 
 async function getToken() {
-  const res = await fetch(`https://${process.env.SFMC_SUBDOMAIN}.auth.marketingcloudapis.com/v2/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      grant_type: 'client_credentials',
-      client_id: process.env.SFMC_CLIENT_ID,
-      client_secret: process.env.SFMC_CLIENT_SECRET
-    })
+  const body = JSON.stringify({
+    grant_type: 'client_credentials',
+    client_id: process.env.SFMC_CLIENT_ID,
+    client_secret: process.env.SFMC_CLIENT_SECRET
   });
-  const data = await res.json();
-  return data.access_token;
+  return new Promise((resolve, reject) => {
+    const req = http.request(`https://${process.env.SFMC_SUBDOMAIN}.auth.marketingcloudapis.com/v2/token`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    }, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => resolve(JSON.parse(d).access_token));
+    });
+    req.on('error', reject); req.write(body); req.end();
+  });
 }
 
-async function sfmcGet(path) {
-  const token = await getToken();
-  const res = await fetch(`https://${process.env.SFMC_SUBDOMAIN}.rest.marketingcloudapis.com${path}`, {
-    headers: { Authorization: `Bearer ${token}` }
-  });
-  return res.json();
-}
-
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
-
-app.get('/sse', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
+const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const serverInfo = { jsonrpc: '2.0', method: 'notifications/initialized', params: {} };
-  res.write(`data: ${JSON.stringify(serverInfo)}\n\n`);
-  req.on('close', () => res.end());
-});
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
 
-app.post('/mcp', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  const { method, params, id } = req.body;
+  if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
-  if (method === 'initialize') {
-    return res.json({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'sfmc-server', version: '1.0.0' } } });
+  const url = new URL(req.url, `http://${req.headers.host}`);
+
+  if (url.pathname === '/sse') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive'
+    });
+    const endpoint = `http://${req.headers.host}/messages`;
+    res.write(`event: endpoint\ndata: ${endpoint}\n\n`);
+    clients.add(res);
+    req.on('close', () => clients.delete(res));
+    return;
   }
 
-  if (method === 'tools/list') {
-    return res.json({ jsonrpc: '2.0', id, result: { tools: [
-      { name: 'get_journeys', description: 'Liste les journeys SFMC', inputSchema: { type: 'object', properties: {} } },
-      { name: 'get_dataextensions', description: 'Liste les Data Extensions SFMC', inputSchema: { type: 'object', properties: {} } },
-      { name: 'get_assets', description: 'Liste les assets SFMC', inputSchema: { type: 'object', properties: {} } }
-    ]}});
+  if (url.pathname === '/messages' && req.method === 'POST') {
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', async () => {
+      const msg = JSON.parse(body);
+      let response;
+
+      if (msg.method === 'initialize') {
+        response = { jsonrpc: '2.0', id: msg.id, result: {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'sfmc', version: '1.0.0' }
+        }};
+      } else if (msg.method === 'tools/list') {
+        response = { jsonrpc: '2.0', id: msg.id, result: { tools: [
+          { name: 'get_journeys', description: 'Liste les journeys SFMC', inputSchema: { type: 'object', properties: {} } },
+          { name: 'get_dataextensions', description: 'Liste les Data Extensions SFMC', inputSchema: { type: 'object', properties: {} } }
+        ]}};
+      } else if (msg.method === 'tools/call') {
+        try {
+          const token = await getToken();
+          const path = msg.params.name === 'get_journeys'
+            ? '/interaction/v1/interactions?$pageSize=20'
+            : '/data/v1/customobjectdata/types/dataextension/collection?$pageSize=20';
+          const data = await new Promise((resolve, reject) => {
+            const r = http.request(`https://${process.env.SFMC_SUBDOMAIN}.rest.marketingcloudapis.com${path}`, {
+              headers: { Authorization: `Bearer ${token}` }
+            }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve(JSON.parse(d))); });
+            r.on('error', reject); r.end();
+          });
+          response = { jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: JSON.stringify(data) }] }};
+        } catch(e) {
+          response = { jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: e.message }};
+        }
+      } else {
+        response = { jsonrpc: '2.0', id: msg.id, result: {} };
+      }
+
+      for (const client of clients) {
+        client.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
+      }
+      res.writeHead(200); res.end();
+    });
+    return;
   }
 
-  if (method === 'tools/call') {
-    try {
-      let data;
-      if (params.name === 'get_journeys') data = await sfmcGet('/interaction/v1/interactions?$pageSize=50');
-      else if (params.name === 'get_dataextensions') data = await sfmcGet('/data/v1/customobjectdata/types/dataextension/collection?$pageSize=50');
-      else if (params.name === 'get_assets') data = await sfmcGet('/asset/v1/content/assets?$pageSize=50');
-      return res.json({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] } });
-    } catch(e) {
-      return res.json({ jsonrpc: '2.0', id, error: { code: -32000, message: e.message } });
-    }
-  }
-
-  res.json({ jsonrpc: '2.0', id, result: {} });
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ status: 'ok' }));
 });
 
-app.options('/mcp', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.sendStatus(200);
-});
-
-app.listen(process.env.PORT || 3000, () => console.log('MCP Server running'));
+server.listen(process.env.PORT || 3000, () => console.log('MCP Server running'));
