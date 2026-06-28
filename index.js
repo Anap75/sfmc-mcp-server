@@ -1,6 +1,6 @@
 const http = require('http');
+const https = require('https');
 const { URL } = require('url');
-
 const clients = new Set();
 
 async function getToken() {
@@ -10,11 +10,14 @@ async function getToken() {
     client_secret: process.env.SFMC_CLIENT_SECRET
   });
   return new Promise((resolve, reject) => {
-    const req = http.request(`https://${process.env.SFMC_SUBDOMAIN}.auth.marketingcloudapis.com/v2/token`, {
+    const req = https.request(`https://${process.env.SFMC_SUBDOMAIN}.auth.marketingcloudapis.com/v2/token`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
     }, res => {
       let d = ''; res.on('data', c => d += c);
-      res.on('end', () => resolve(JSON.parse(d).access_token));
+      res.on('end', () => {
+        try { resolve(JSON.parse(d).access_token); }
+        catch(e) { reject(new Error('Token parse error: ' + d)); }
+      });
     });
     req.on('error', reject); req.write(body); req.end();
   });
@@ -24,9 +27,7 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
-
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
-
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   if (url.pathname === '/sse') {
@@ -35,7 +36,7 @@ const server = http.createServer(async (req, res) => {
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive'
     });
-    const endpoint = `http://${req.headers.host}/messages`;
+    const endpoint = `https://${req.headers.host}/messages`;
     res.write(`event: endpoint\ndata: ${endpoint}\n\n`);
     clients.add(res);
     req.on('close', () => clients.delete(res));
@@ -48,7 +49,6 @@ const server = http.createServer(async (req, res) => {
     req.on('end', async () => {
       const msg = JSON.parse(body);
       let response;
-
       if (msg.method === 'initialize') {
         response = { jsonrpc: '2.0', id: msg.id, result: {
           protocolVersion: '2024-11-05',
@@ -67,9 +67,11 @@ const server = http.createServer(async (req, res) => {
             ? '/interaction/v1/interactions?$pageSize=20'
             : '/data/v1/customobjectdata/types/dataextension/collection?$pageSize=20';
           const data = await new Promise((resolve, reject) => {
-            const r = http.request(`https://${process.env.SFMC_SUBDOMAIN}.rest.marketingcloudapis.com${path}`, {
+            const r = https.request(`https://${process.env.SFMC_SUBDOMAIN}.rest.marketingcloudapis.com${path}`, {
               headers: { Authorization: `Bearer ${token}` }
-            }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => resolve(JSON.parse(d))); });
+            }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => {
+              try { resolve(JSON.parse(d)); } catch(e) { reject(new Error('API parse error: ' + d)); }
+            }); });
             r.on('error', reject); r.end();
           });
           response = { jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: JSON.stringify(data) }] }};
@@ -79,7 +81,6 @@ const server = http.createServer(async (req, res) => {
       } else {
         response = { jsonrpc: '2.0', id: msg.id, result: {} };
       }
-
       for (const client of clients) {
         client.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
       }
